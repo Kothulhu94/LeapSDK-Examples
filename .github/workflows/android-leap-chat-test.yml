@@ -3,8 +3,11 @@ name: Android Leap Chat Test
 on:
   workflow_dispatch:
   push:
-    paths:
-      - '.github/workflows/android-leap-chat-test.yml'
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
   build:
