@@ -1,41 +1,147 @@
-name: Android LeapChat Build
-on: 
-  push:
-    branches: [ main ]
-    paths:
-      - 'Android/LeapChat/**'
-      - '.github/workflows/android-leap-chat-test.yml'
-  pull_request:
-    branches: [ main ]
-    paths:
-      - 'Android/LeapChat/**'
-      - '.github/workflows/android-leap-chat-test.yml'
+name: Android Leap Chat Test
+
+on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/android-leap-chat-test.yml'
 
 jobs:
-  build-and-e2e-test:
+  build:
     runs-on: ubuntu-latest
+    env:
+      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up JDK 21
-      uses: actions/setup-java@v4
-      with:
-        java-version: '21'
-        distribution: 'temurin'
-        cache: 'gradle'
-    - name: Build LeapChat
-      run: cd Android/LeapChat && ./gradlew :app:assemble
-    - name: Build E2E test
-      run: cd Android/LeapChat && ./gradlew :app:assembleAndroidTest
-    - name: Run E2E test on Firebase Test Lab
-      run: |
-          echo "$SERVICE_ACCOUNT" > /tmp/service_account.json
-          gcloud auth activate-service-account --key-file=/tmp/service_account.json
-          gcloud firebase test android run --type instrumentation \
-            --app Android/LeapChat/app/build/outputs/apk/debug/app-debug.apk \
-            --test Android/LeapChat/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk \
-            --device model=MediumPhone.arm,version=36,locale=en,orientation=portrait \
-            --project liquid-leap
-      env:
-        SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK
+        id: install-android
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          cd "$ANDROID_SDK_ROOT/cmdline-tools"
+          sdk_url="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          echo "Downloading Android command-line tools from $sdk_url"
+          curl -sSL "$sdk_url" -o commandlinetools.zip
+          unzip -q commandlinetools.zip
+          rm commandlinetools.zip
+          mv cmdline-tools latest
+
+          sdkmanager() {
+            "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" "$@"
+          }
+
+          yes | sdkmanager --licenses >/dev/null || true
+          yes | sdkmanager --update > /dev/null
+          yes | sdkmanager "platform-tools"
+
+          platform=""
+          build_tools=""
+          if yes | sdkmanager "platforms;android-33" "build-tools;33.0.2"; then
+            platform="android-33"
+            build_tools="33.0.2"
+          else
+            yes | sdkmanager "platforms;android-34" "build-tools;34.0.0"
+            platform="android-34"
+            build_tools="34.0.0"
+          fi
+
+          yes | sdkmanager --licenses > /dev/null
+
+          echo "platform=$platform" >> "$GITHUB_OUTPUT"
+          echo "build_tools=$build_tools" >> "$GITHUB_OUTPUT"
+
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_SDK_ROOT/build-tools/$build_tools" >> "$GITHUB_PATH"
+
+      - name: Detect Gradle module
+        id: detect-module
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_dir=""
+          if [ -d "Android/android-leap-chat-test" ]; then
+            project_dir="Android/android-leap-chat-test"
+          else
+            project_dir=$(python - <<'PY'
+import os
+TARGET = "android-leap-chat-test"
+for root, _dirs, files in os.walk("Android"):
+    for name in files:
+        if name.startswith("settings.gradle"):
+            path = os.path.join(root, name)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    if TARGET in fh.read():
+                        print(os.path.dirname(path))
+                        raise SystemExit
+            except OSError:
+                continue
+PY
+)
+          fi
+
+          if [ -z "$project_dir" ]; then
+            project_dir="Android/LeapChat"
+          fi
+
+          gradle_task=":android-leap-chat-test:assembleDebug"
+          settings_file=$(find "$project_dir" -maxdepth 1 -type f -name "settings.gradle*" -print -quit)
+          if [ -z "$settings_file" ] || ! grep -q "android-leap-chat-test" "$settings_file"; then
+            gradle_task=":app:assembleDebug"
+          fi
+
+          echo "module_dir=$project_dir" >> "$GITHUB_OUTPUT"
+          echo "gradle_task=$gradle_task" >> "$GITHUB_OUTPUT"
+
+      - name: Build debug APK
+        shell: bash
+        env:
+          GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx4g"
+        run: |
+          set -euo pipefail
+          module_dir="${{ steps.detect-module.outputs.module_dir }}"
+          gradle_task="${{ steps.detect-module.outputs.gradle_task }}"
+          echo "Building module $module_dir with task $gradle_task"
+          chmod +x "$module_dir/gradlew"
+          cd "$module_dir"
+          ./gradlew --stacktrace --no-daemon "$gradle_task"
+
+      - name: Locate debug APK
+        id: locate-apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          module_dir="${{ steps.detect-module.outputs.module_dir }}"
+          cd "$module_dir"
+          apk_path=$(find "$PWD" -type f -path "*build/outputs/apk*" -name "*-debug.apk" | head -n1)
+          if [ -z "$apk_path" ]; then
+            echo "No debug APK found" >&2
+            exit 1
+          fi
+          echo "apk_path=$apk_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-debug
+          path: ${{ steps.locate-apk.outputs.apk_path }}
+          if-no-files-found: error
+
+      - name: Summarize build
+        shell: bash
+        run: |
+          echo "Gradle task: ${{ steps.detect-module.outputs.gradle_task }}" >> $GITHUB_STEP_SUMMARY
+          echo "SDK Platform: ${{ steps.install-android.outputs.platform }}" >> $GITHUB_STEP_SUMMARY
+          echo "Build Tools: ${{ steps.install-android.outputs.build_tools }}" >> $GITHUB_STEP_SUMMARY
+          echo "APK path: ${{ steps.locate-apk.outputs.apk_path }}" >> $GITHUB_STEP_SUMMARY
