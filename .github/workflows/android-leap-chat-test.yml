@@ -76,22 +76,10 @@ jobs:
           if [ -d "Android/android-leap-chat-test" ]; then
             project_dir="Android/android-leap-chat-test"
           else
-            project_dir=$(python - <<'PY'
-import os
-TARGET = "android-leap-chat-test"
-for root, _dirs, files in os.walk("Android"):
-    for name in files:
-        if name.startswith("settings.gradle"):
-            path = os.path.join(root, name)
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    if TARGET in fh.read():
-                        print(os.path.dirname(path))
-                        raise SystemExit
-            except OSError:
-                continue
-PY
-)
+            settings_match=$(find Android -type f -name "settings.gradle*" -print0 | xargs -0 -r grep -l "android-leap-chat-test" | head -n1 || true)
+            if [ -n "$settings_match" ]; then
+              project_dir=$(dirname "$settings_match")
+            fi
           fi
 
           if [ -z "$project_dir" ]; then
@@ -115,6 +103,14 @@ PY
           set -euo pipefail
           module_dir="${{ steps.detect-module.outputs.module_dir }}"
           gradle_task="${{ steps.detect-module.outputs.gradle_task }}"
+          sdk_dir="$ANDROID_SDK_ROOT"
+
+          if [ -z "$sdk_dir" ]; then
+            echo "ANDROID_SDK_ROOT is not set" >&2
+            exit 1
+          fi
+
+          printf 'sdk.dir=%s\n' "$sdk_dir" > "$module_dir/local.properties"
           echo "Building module $module_dir with task $gradle_task"
           chmod +x "$module_dir/gradlew"
           cd "$module_dir"
